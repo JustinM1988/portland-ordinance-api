@@ -1,0 +1,143 @@
+{
+  "openapi": "3.0.1",
+  "info": {
+    "title": "Portland Ordinance API",
+    "version": "1.0.0",
+    "description": "Live ordinance lookup for City of Portland, TX (Municode wrapper)."
+  },
+  "servers": [
+    {
+      "url": "https://YOUR-RENDER-URL"
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "apiKeyAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-api-key"
+      }
+    },
+    "schemas": {
+      "OrdinanceSection": {
+        "type": "object",
+        "properties": {
+          "section_number": {
+            "type": "string",
+            "nullable": true
+          },
+          "title": {
+            "type": "string",
+            "nullable": true
+          },
+          "url": {
+            "type": "string",
+            "nullable": true
+          },
+          "snippet": {
+            "type": "string",
+            "nullable": true
+          },
+          "text": {
+            "type": "string",
+            "nullable": true
+          },
+          "headings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "SearchResult": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string"
+          },
+          "results": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OrdinanceSection"
+            }
+          }
+        }
+      }
+    }
+  },
+  "security": [
+    {
+      "apiKeyAuth": []
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "operationId": "health",
+        "summary": "Health check",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/fetchByUrl": {
+      "get": {
+        "operationId": "fetchByUrl",
+        "summary": "Fetch a specific Municode section by URL",
+        "parameters": [
+          {
+            "name": "url",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Section",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrdinanceSection"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/searchOrdinance": {
+      "get": {
+        "operationId": "searchOrdinance",
+        "summary": "Search Portland Municode for matching sections",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Search results",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SearchResult"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

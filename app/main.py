@@ -12,7 +12,9 @@ from datetime import date
 
 app = FastAPI(title="Portland Ordinance API", version="1.0.0")
 
+# ---------------------------------------------------------------------------
 # CORS (tighten allow_origins later if you want)
+# ---------------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,13 +23,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---- Security / rate limiting ------------------------------------------------
+# ---------------------------------------------------------------------------
+# Security / rate limiting
+# ---------------------------------------------------------------------------
 API_KEY = os.getenv("API_KEY", "")
 
 # Simple in-memory rate limiter (per IP)
 RATE_LIMIT = 60  # requests per minute
 _window = 60.0
 _calls: Dict[str, List[float]] = {}
+
 
 def _rate_limit(ip: str) -> bool:
     now = time.time()
@@ -40,12 +45,14 @@ def _rate_limit(ip: str) -> bool:
     bucket.append(now)
     return True
 
+
 def _require_api_key(key: Optional[str]):
     expected = os.getenv("API_KEY", "")
     if not expected:
         # If API_KEY not set (dev mode), allow all
         return True
     return key == expected
+
 
 # Allow unauthenticated health + privacy so probes/public policy work
 @app.middleware("http")
@@ -66,8 +73,14 @@ async def guard(request: Request, call_next):
 
     return await call_next(request)
 
-# ---- App routes --------------------------------------------------------------
-MUNICODE_BASE = "https://library.municode.com/tx/portland/codes/code_of_ordinances?nodeId=COOR_APXAUNDEOR"
+
+# ---------------------------------------------------------------------------
+# App routes
+# ---------------------------------------------------------------------------
+MUNICODE_BASE = (
+    "https://library.municode.com/tx/portland/codes/code_of_ordinances?nodeId=COOR_APXAUNDEOR"
+)
+
 
 class OrdinanceSection(BaseModel):
     section_number: Optional[str] = None
@@ -77,14 +90,17 @@ class OrdinanceSection(BaseModel):
     text: Optional[str] = None
     headings: Optional[List[str]] = None
 
+
 @app.get("/health")
 async def health():
     return {"ok": True, "source": "municode", "base": MUNICODE_BASE}
+
 
 # Extra unauthenticated health endpoint for Render
 @app.get("/healthz")
 async def healthz():
     return {"ok": True}
+
 
 # ---------- Privacy Policy (HTML) ----------
 PRIVACY_HTML = """
@@ -141,10 +157,12 @@ PRIVACY_HTML = """
 </html>
 """
 
+
 @app.get("/privacy", response_class=HTMLResponse)
 async def privacy():
     today = date.today().strftime("%B %d, %Y")
     return HTMLResponse(PRIVACY_HTML.replace("{{date}}", today))
+
 
 def _clean_text(html: str) -> str:
     soup = BeautifulSoup(html, "lxml")
@@ -153,12 +171,21 @@ def _clean_text(html: str) -> str:
     text = soup.get_text("\n", strip=True)
     return re.sub(r"\n{3,}", "\n\n", text)
 
+
 async def fetch_url(url: str) -> str:
     timeout = httpx.Timeout(20.0, connect=20.0)
-    async with httpx.AsyncClient(timeout=timeout, headers={"User-Agent": "PortlandOrdinanceBot/1.0"}) as client:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0 Safari/537.36 PortlandOrdinanceBot/1.0"
+        )
+    }
+    async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
         r = await client.get(url, follow_redirects=True)
         r.raise_for_status()
         return r.text
+
 
 def extract_section_fields(url: str, html: str) -> OrdinanceSection:
     soup = BeautifulSoup(html, "lxml")
@@ -192,6 +219,7 @@ def extract_section_fields(url: str, html: str) -> OrdinanceSection:
         headings=[h for h in headings if h],
     )
 
+
 @app.get("/fetchByUrl", response_model=OrdinanceSection)
 async def fetch_by_url(url: str = Query(..., description="Direct Municode section URL")):
     if "library.municode.com" not in url:
@@ -199,27 +227,60 @@ async def fetch_by_url(url: str = Query(..., description="Direct Municode sectio
     html = await fetch_url(url)
     return extract_section_fields(url, html)
 
+
 class SearchResult(BaseModel):
     results: List[OrdinanceSection]
     query: str
 
-DUCK = "https://duckduckgo.com/html/"
+
+# Tolerant DuckDuckGo HTML endpoint
+DUCK = "https://html.duckduckgo.com/html/"
+
 
 async def duckduck_search(query: str) -> List[str]:
-    # Simple site-limited search to Municode (no API keys)
-    q = f"site:library.municode.com tx portland code of ordinances {query}"
+    """
+    Use DuckDuckGo HTML to find Municode pages for Portland, TX.
+    Be resilient to non-200 responses/timeouts and just return [] on failure.
+    """
+    # keep it specific to Portland, TX municode
+    q = f"site:library.municode.com/tx/portland {query}"
     params = {"q": q}
     timeout = httpx.Timeout(20.0, connect=20.0)
-    async with httpx.AsyncClient(timeout=timeout, headers={"User-Agent": "PortlandOrdinanceBot/1.0"}) as client:
-        r = await client.get(DUCK, params=params)
-        r.raise_for_status()
-        html = r.text
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0 Safari/537.36 PortlandOrdinanceBot/1.0"
+        )
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
+            r = await client.get(DUCK, params=params, follow_redirects=True)
+            # If DDG returns a non-200 or empty body, return [] instead of raising
+            if r.status_code != 200 or not r.text:
+                return []
+            html = r.text
+    except Exception as e:
+        # Log to Render logs and return no results rather than erroring out
+        print("duckduck_search error:", repr(e))
+        return []
+
     soup = BeautifulSoup(html, "lxml")
     links: List[str] = []
+
+    # Primary selector
     for a in soup.select("a.result__a"):
         href = a.get("href")
         if href and "library.municode.com" in href:
             links.append(href)
+
+    # Fallback selector, in case layout changes
+    if not links:
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if "library.municode.com" in href:
+                links.append(href)
 
     # De-duplicate, keep top 5
     seen = set()
@@ -230,10 +291,14 @@ async def duckduck_search(query: str) -> List[str]:
             uniq.append(u)
         if len(uniq) >= 5:
             break
+
     return uniq
 
+
 @app.get("/searchOrdinance", response_model=SearchResult)
-async def search_ordinance(q: str = Query(..., min_length=2, description="Keywords to search within Municode for Portland, TX")):
+async def search_ordinance(
+    q: str = Query(..., min_length=2, description="Keywords to search within Municode for Portland, TX")
+):
     urls = await duckduck_search(q)
     if not urls:
         return SearchResult(query=q, results=[])
@@ -242,6 +307,8 @@ async def search_ordinance(q: str = Query(..., min_length=2, description="Keywor
         try:
             html = await fetch_url(url)
             results.append(extract_section_fields(url, html))
-        except Exception:
+        except Exception as e:
+            # log and keep going
+            print("fetch_or_parse error:", repr(e))
             continue
     return SearchResult(query=q, results=results)

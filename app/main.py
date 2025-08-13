@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict
@@ -8,6 +8,7 @@ import httpx
 from bs4 import BeautifulSoup
 import re
 import time
+from datetime import date
 
 app = FastAPI(title="Portland Ordinance API", version="1.0.0")
 
@@ -46,11 +47,11 @@ def _require_api_key(key: Optional[str]):
         return True
     return key == expected
 
-# Allow Render to probe health without API key
+# Allow unauthenticated health + privacy so probes/public policy work
 @app.middleware("http")
 async def guard(request: Request, call_next):
     path = request.url.path
-    if path in ("/health", "/healthz"):
+    if path in ("/health", "/healthz", "/privacy"):
         return await call_next(request)
 
     # rate limit
@@ -84,6 +85,66 @@ async def health():
 @app.get("/healthz")
 async def healthz():
     return {"ok": True}
+
+# ---------- Privacy Policy (HTML) ----------
+PRIVACY_HTML = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Privacy Policy — Portland Ordinance API</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;max-width:820px;margin:2rem auto;padding:0 1rem;line-height:1.55}code{background:#f4f4f4;padding:2px 4px;border-radius:4px}</style>
+</head>
+<body>
+<h1>Privacy Policy — Portland Ordinance API</h1>
+<p><strong>Effective:</strong> {{date}}</p>
+
+<h2>What this service does</h2>
+<p>This API retrieves public ordinance pages from <code>library.municode.com</code> for the City of Portland, TX and returns the text to client applications (e.g., a Custom GPT) for analysis and citation. It is read-only and does not modify external systems.</p>
+
+<h2>Data processed</h2>
+<ul>
+  <li><strong>Request details</strong>: endpoint and query parameters you send (e.g., search terms, Municode URLs).</li>
+  <li><strong>Network metadata</strong>: client IP address for rate limiting and abuse prevention.</li>
+  <li><strong>Operational logs</strong>: timestamps and status codes for troubleshooting.</li>
+</ul>
+<p>No cookies are set. No names, emails, or account identifiers are intentionally collected.</p>
+
+<h2>Retention</h2>
+<ul>
+  <li>Rate-limit buckets are in-memory and ephemeral.</li>
+  <li>Host (Render) may retain short-lived logs for operations.</li>
+</ul>
+
+<h2>Sharing</h2>
+<ul>
+  <li>Requests are sent to <code>library.municode.com</code> to fetch public ordinance content.</li>
+  <li>No data is sold or shared for advertising.</li>
+</ul>
+
+<h2>Security</h2>
+<ul>
+  <li>All traffic uses HTTPS.</li>
+  <li>Access to protected endpoints requires an <code>x-api-key</code> header. Keys can be rotated if compromised.</li>
+</ul>
+
+<h2>Your choices</h2>
+<ul>
+  <li>Do not send sensitive or non-public information to this API.</li>
+  <li>For concerns or deletion requests (where applicable), contact us.</li>
+</ul>
+
+<h2>Contact</h2>
+<p>Email: <a href="mailto:gisteam@portlandtx.gov">gisteam@portlandtx.gov</a></p>
+</body>
+</html>
+"""
+
+@app.get("/privacy", response_class=HTMLResponse)
+async def privacy():
+    today = date.today().strftime("%B %d, %Y")
+    return HTMLResponse(PRIVACY_HTML.replace("{{date}}", today))
 
 def _clean_text(html: str) -> str:
     soup = BeautifulSoup(html, "lxml")

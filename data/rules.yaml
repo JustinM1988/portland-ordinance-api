@@ -1,0 +1,18 @@
+term_expansions:
+  led:
+    - "leisure and entertainment district"
+    - "sec. 515"
+  bar:
+    - "alcoholic beverages"
+    - "on-premises consumption"
+  fence:
+    - "fences"
+    - "screening"
+
+mappings:
+  "leisure and entertainment district":
+    - "S515"
+
+boosts:
+  S515: 0.6
+  S406: 0.4

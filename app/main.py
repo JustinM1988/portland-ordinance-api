@@ -1,15 +1,15 @@
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Tuple
 from pathlib import Path
-import os, re, time, yaml
+import os, re, time, yaml, json
 import httpx
 from bs4 import BeautifulSoup
 from datetime import date
 
-app = FastAPI(title="Portland Ordinance API", version="1.1.0")
+app = FastAPI(title="Portland Ordinance API", version="1.2.0")
 
 # CORS (tighten later if needed)
 app.add_middleware(
@@ -22,6 +22,7 @@ app.add_middleware(
 
 # ---- Security / rate limiting ------------------------------------------------
 API_KEY = os.getenv("API_KEY", "")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 
 RATE_LIMIT = 60  # requests per minute
 _window = 60.0
@@ -43,6 +44,12 @@ def _require_api_key(key: Optional[str]):
         return True  # dev mode
     return key == expected
 
+def _require_admin_token(key: Optional[str]):
+    expected = os.getenv("ADMIN_TOKEN", "")
+    if not expected:
+        return False
+    return key == expected
+
 # Allow unauthenticated health + privacy so probes/public policy work
 @app.middleware("http")
 async def guard(request: Request, call_next):
@@ -54,11 +61,40 @@ async def guard(request: Request, call_next):
     if not _rate_limit(ip):
         return JSONResponse({"error": "rate_limit_exceeded"}, status_code=429)
 
+    # All non-health routes require x-api-key (admin routes do their own extra check)
     api_key = request.headers.get("x-api-key")
     if not _require_api_key(api_key):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
 
     return await call_next(request)
+
+# ---- Data dir helpers --------------------------------------------------------
+def _data_dir() -> Path:
+    # default to repo /data so it also works locally. On Render you set DATA_DIR env.
+    root = Path(os.getenv("DATA_DIR", str(Path(__file__).resolve().parent.parent / "data")))
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+def _append_jsonl(path: Path, obj: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+def _read_jsonl(path: Path, limit: int) -> List[dict]:
+    if not path.exists():
+        return []
+    rows: List[dict] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                continue
+    # most recent last → return tail
+    return rows[-limit:] if limit and limit > 0 else rows
 
 # ---- Rules (synonyms/boosts) -------------------------------------------------
 RULES_PATH = Path(__file__).resolve().parent.parent / "data" / "rules.yaml"
@@ -72,6 +108,11 @@ def _load_rules() -> Dict:
         except Exception:
             return {}
     return {}
+
+def _save_rules(new_rules: Dict):
+    RULES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(RULES_PATH, "w", encoding="utf-8") as f:
+        yaml.safe_dump(new_rules, f, sort_keys=False, allow_unicode=True)
 
 @app.on_event("startup")
 def _startup():
@@ -89,14 +130,12 @@ def _expand_queries(q: str) -> Tuple[List[str], List[str]]:
 
     q_low = q.lower()
     te = (RULES.get("term_expansions") or {})
-    # if a key or any of its aliases appear, add those phrases as extra queries
     for key, phrases in te.items():
         if key in q_low or any(p in q_low for p in phrases):
             for p in phrases:
                 if p not in queries:
                     queries.append(p)
 
-    # mappings: if a phrase appears in q, add preferred codes to boost
     mappings = (RULES.get("mappings") or {})
     for phrase, codes in mappings.items():
         if phrase.lower() in q_low:
@@ -107,17 +146,11 @@ def _expand_queries(q: str) -> Tuple[List[str], List[str]]:
     return queries, favored_codes
 
 def _score_url(url: str, index_in_list: int, favored_codes: List[str]) -> float:
-    """
-    Higher score = ranked higher. Earlier URLs in the list get a small base,
-    and URLs that include favored/boosted section codes get an extra boost.
-    """
-    score = 1.0 / (index_in_list + 1)  # earlier results get a bit more weight
+    score = 1.0 / (index_in_list + 1)
     boosts = RULES.get("boosts") or {}
-    # Municode URLs often contain "S###" in nodeId; reward matches
     for code, weight in boosts.items():
         if code in url.upper():
             score += float(weight)
-    # If user’s query mapped to favored codes, give extra
     for code in favored_codes:
         if code in url.upper():
             score += 0.2
@@ -293,3 +326,76 @@ async def search_ordinance(q: str = Query(..., min_length=2, description="Keywor
             continue
 
     return SearchResult(query=q, results=results)
+
+# ---- Feedback + Admin endpoints ---------------------------------------------
+
+class FeedbackPayload(BaseModel):
+    rating: int = Field(ge=1, le=5, description="1 to 5 stars")
+    comment: Optional[str] = None
+    question: Optional[str] = None
+    answer: Optional[str] = None
+    tags: Optional[List[str]] = None
+
+@app.post("/feedback")
+async def submit_feedback(payload: FeedbackPayload, request: Request):
+    """
+    Public (uses x-api-key via middleware). Stores a single feedback record.
+    """
+    record = {
+        "ts": time.time(),
+        "ip": request.client.host if request.client else None,
+        **payload.model_dump(),
+    }
+    _append_jsonl(_data_dir() / "feedback.jsonl", record)
+    return {"ok": True}
+
+class RulePatch(BaseModel):
+    term_expansions: Optional[Dict[str, List[str]]] = None
+    mappings: Optional[Dict[str, List[str]]] = None
+    boosts: Optional[Dict[str, float]] = None
+    note: Optional[str] = None  # audit trail note
+
+@app.get("/admin/feedback")
+async def admin_list_feedback(request: Request, limit: int = 50):
+    """
+    Admin-only. View recent feedback.
+    """
+    if not _require_admin_token(request.headers.get("x-admin-token")):
+        raise HTTPException(status_code=401, detail="admin_unauthorized")
+    rows = _read_jsonl(_data_dir() / "feedback.jsonl", limit)
+    return {"count": len(rows), "items": rows}
+
+@app.post("/admin/rules")
+async def admin_update_rules(patch: RulePatch, request: Request):
+    """
+    Admin-only. Merge a small patch into rules.yaml and hot-reload.
+    """
+    if not _require_admin_token(request.headers.get("x-admin-token")):
+        raise HTTPException(status_code=401, detail="admin_unauthorized")
+
+    global RULES
+    rules = _load_rules()
+
+    def merge_dict(d: Dict, p: Dict):
+        for k, v in p.items():
+            if isinstance(v, dict) and isinstance(d.get(k), dict):
+                merge_dict(d[k], v)
+            else:
+                d[k] = v
+
+    incoming = patch.model_dump(exclude_none=True)
+    incoming.pop("note", None)  # optional, not written to yaml
+
+    merge_dict(rules, incoming)
+    _save_rules(rules)
+    RULES = rules  # hot reload
+
+    # audit entry
+    audit = {
+        "ts": time.time(),
+        "note": patch.note or "manual update",
+        "patch": incoming,
+    }
+    _append_jsonl(_data_dir() / "rules_audit.jsonl", audit)
+
+    return {"ok": True, "rules_path": str(RULES_PATH)}
